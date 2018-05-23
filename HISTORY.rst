@@ -2,6 +2,90 @@
 History
 =======
 
+1.5.2 (2018-05-15)
+------------------
+* Inner volume egg segmentation (#147)
+
+1.5.1 (2018-02-27)
+------------------
+* Transpose, z-bin, and scaling bug fix, and smoothing of ER template in FV (#145, #146) 
+
+1.5.0 (2018-02-23)
+------------------
+
+* Add Z-optimized FV and swap in cut list (#144)
+
+1.4.0 (2018-02-07)
+------------------
+
+* Fix MV cut; was not applied before (#129, #130)
+* Small fix S1AreaUpperInjectionFraction line (#132)
+* Tighten S1 width cut (#131)
+* Use drift time instead of Z for S2 width cut (#134) 
+* Ignore dead PMTs and split top/bottom for S1PatternLikelihood (#137) 
+* New SingleElectronS2 cut (#139, #143)
+* Use signal quantile of distance distribution only for PosDiff (#138)
+* Switch to tighter corrected S2 AFT variable and use fitted quantile (#142)
+
+1.3.0 (2018-01-05)
+------------------
+
+* MV cut to account for the coverage (#119)
+* Remove MV cut from calibration data (#121)
+* Use correct position for S1PatternLikelihood cut (#123)
+* New S1 width cut to remove AC candidates (#124)
+* New cut on area fraction near Rn220 injection points (#125)
+* Tune S1 AFT cut based on bug fix and correct position (#126)
+* Revert to SR0 version of S2 tail cut (#128)
+* Optimise the PosDiff Cut (#127), interim update (#120)
+
+1.2.2 (2017-12-04)
+------------------
+
+* Update S1PatternLikelihood Definition (#101)
+* Add Flash cut to SR0 (#104)
+* Add flash cut variable to SR1 (#102)
+* Add cut for Misidentified krypton S1 (#103)
+* Add check that nearest flash isn't nan (#106)
+* Add parentheses (#107)
+* Try again with flasher cut (#108)
+* Remove S2 tail cut from calibration modes (#88)
+* Try again Flash cut (#109)
+* Update S2Width Cut (#96)
+* Change bounds on S1SingleScatter Cut (#113)
+* PosDiff Cut Definition (#111)
+* S2Width Warnings Fix (#114)
+* Add PosDiff; Remove S2Tails (duplicate); SR1 (#115)
+* Remove S2Tails (duplicate); SR0 (#116)
+* Fix S2Tails bug in cut lists (#117)
+
+
+1.2.1 (2017-11-27)
+------------------
+
+* Muon Veto cut added (#55)
+* Update on S1 Pattern Likelihood Cut (#99)
+* Add super elliptical fiducial volumes for testing in SR1 (#100)
+
+1.2.0 (2017-11-20)
+------------------
+Interim	release	for tracking data used in preliminary fits
+(https://github.com/XENON1T/bbf/pull/35)
+(https://github.com/XENON1T/SR1Results/pull/2)
+ 
+* S1 area fraction top update and relegate to LowE (#56, #83)
+* Update S2WidthCut and parameters for SR1 (#62, #75, #77)
+* Fix LowEnergyRn220 accidentally removing DAQVeto cut (#66)
+* Fix bug and treatment of 'nan' in S2SingleScatter (#69, #74)
+* Reinstate InteractionPeaksBiggest (#71)
+* Update S2Tail cut for SR1 (#76)
+* S2PatternLikelihood Cut Tuning (#80, #87)
+* Fix AmBe source position (#58, #97)
+* Remove AmBe/NGFiducial cuts (#86, #98)
+* Temporary 1.3T FV (#89, #94)
+* Add Corrections minitree and SR1 switch to laxer (#64)
+* Documentation (#73, #92)
+
 1.0.0 (2017-06-22)
 ------------------
 

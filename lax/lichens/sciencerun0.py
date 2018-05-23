@@ -7,14 +7,12 @@ This includes all current definitions of the cuts for the first science run
 import inspect
 import os
 import pytz
+import pickle  # noqa
 
 import numpy as np
-from pax import units, configuration
+from pax import units
 
-from scipy.interpolate import RectBivariateSpline
-from scipy.stats import binom_test
-from scipy import interpolate
-import json
+from scipy.stats import chi2
 
 from lax.lichen import Lichen, RangeLichen, ManyLichen, StringLichen
 from lax import __version__ as lax_version
@@ -33,16 +31,20 @@ class AllEnergy(ManyLichen):
 
     def __init__(self):
         self.lichen_list = [
-            FiducialCylinder1T(),
+            FiducialZOptimized(),
             InteractionExists(),
             S2Threshold(),
             InteractionPeaksBiggest(),
-            S2AreaFractionTop(),
+            CS2AreaFractionTop(),
             S2SingleScatter(),
+            S2Width(),
             DAQVeto(),
             S1SingleScatter(),
             S2PatternLikelihood(),
-            S2Tails()
+            KryptonMisIdS1(),
+            Flash(),
+            PosDiff(),
+            SingleElectronS2s()
         ]
 
 
@@ -51,24 +53,34 @@ class LowEnergyRn220(AllEnergy):
 
     This is the list that we use for the Rn220 data to calibrate ER in the
     region of interest.
-
-    It doesn't contain the PreS2Junk cut
     """
 
     def __init__(self):
         AllEnergy.__init__(self)
-        # Replaces Interaction exists
-        self.lichen_list[1] = S1LowEnergyRange()
 
-        # Use a simpler single scatter cut
-        self.lichen_list[5] = S2SingleScatterSimple()
+        # Customize cuts for calibration data
+        for idx, lichen in enumerate(self.lichen_list):
 
+            # Replaces InteractionExists with energy cut (tighter)
+            if lichen.name() == "CutInteractionExists":
+                self.lichen_list[idx] = S1LowEnergyRange()
+
+            # Use a simpler single scatter cut for LowE
+            if lichen.name() == "CutS2SingleScatter":
+                self.lichen_list[idx] = S2SingleScatterSimple()
+
+        # Add additional LowE cuts (that may not be tuned at HighE yet)
         self.lichen_list += [
             S1PatternLikelihood(),
-            S2Width(),
             S1MaxPMT(),
-            SingleElectronS2s(),
             S1AreaFractionTop(),
+            S1Width()
+        ]
+
+        # Add injection-position cuts (not for AmBe)
+        self.lichen_list += [
+            S1AreaUpperInjectionFraction(),
+            S1AreaLowerInjectionFraction()
         ]
 
 
@@ -76,28 +88,32 @@ class LowEnergyBackground(LowEnergyRn220):
     """Select background events with cs1<200
 
     This is the list that we'll use for the actual DM search. Additionally to the
-    LowEnergyRn220 list it contains the PreS2Junk
+    LowEnergyAmBe list it contains the PreS2Junk, S2Tails, and MuonVeto
     """
 
     def __init__(self):
         LowEnergyRn220.__init__(self)
 
+        # Add cuts specific to background only
         self.lichen_list += [
             PreS2Junk(),
+            S2Tails(),  # Only for LowE background (#88)
+            MuonVeto()
         ]
 
 
 class LowEnergyAmBe(LowEnergyRn220):
     """Select AmBe events with cs1<200 with appropriate cuts
 
-    It is the same as the LowEnergyRn220 cuts, except uses an AmBe fiducial.
+    It is the same as the LowEnergyRn220 cuts, except injection-related cuts
     """
 
     def __init__(self):
         LowEnergyRn220.__init__(self)
 
-        # Replaces Fiducial
-        self.lichen_list[0] = AmBeFiducial()
+        # Remove cuts not applicable to AmBe
+        self.lichen_list = [lichen for lichen in self.lichen_list
+                            if "InjectionFraction" not in lichen.name()]
 
 
 class DAQVeto(ManyLichen):
@@ -191,7 +207,7 @@ class S2Tails(Lichen):
         return df
 
 
-class FiducialCylinder1T(StringLichen):
+class FiducialCylinder1T_TPF2dFDC(StringLichen):
     """Fiducial volume cut.
 
     The fidicual volume cut defines the region in depth and radius that we
@@ -200,6 +216,8 @@ class FiducialCylinder1T(StringLichen):
 
     This version of the cut is based pax v6.4 bg run 0 data. See the
     note first results fiducial volume note for the study of the definition.
+
+    (Used to be "FiducialCylinder1T" version 4.)
 
     Contact: Sander breur <sanderb@nikhef.nl>
 
@@ -212,6 +230,17 @@ class FiducialCylinder1T(StringLichen):
         return df
 
 
+class FiducialCylinder1T(StringLichen):
+    """Fiducial volume cut using NN 3D FDC instead of TPF 2D FDC above.
+
+    Temporary/under development, for preliminary comparisons to
+    FiducialCylinder1p3T below.
+
+    """
+    version = 5
+    string = "(-92.9 < z_3d_nn) & (z_3d_nn < -9) & (r_3d_nn < 36.94)"
+
+
 class FiducialCylinder1p3T(StringLichen):
     """Larger fiducial volume cut for benchmarking and development.
 
@@ -221,11 +250,118 @@ class FiducialCylinder1p3T(StringLichen):
 
     """
     version = 0
-    string = "(-92.9 < z_3d_nn) & (z_3d_nn < -9) & (sqrt(x_3d_nn*x_3d_nn + y_3d_nn*y_3d_nn) < 41.26)"
+    string = "(-92.9 < z_3d_nn) & (z_3d_nn < -9) & (r_3d_nn < 41.26)"
+
+
+class FiducialZOptimized(StringLichen):
+    """Z-optimized FV cut based on keeping expected rate variation within 10% threshold within each
+    R slice, i.e. ~uniform in Z accounting for all backgrounds models.
+
+    This first version is a bit rough and may be improved by understanding the underlying BG KDE
+    and errors better.
+
+    https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:analysis:sciencerun1:summary_fiducial_volume_v4
+    """
+    version = 4
+    string = "(-94 < z_3d_nn) & (z_3d_nn < -8) & (r_3d_nn < 42.8387) & \
+              (z_3d_nn < -2.63725 - 0.00946597*r_3d_nn*r_3d_nn) & \
+              (z_3d_nn > -158.173 + 0.0456094*r_3d_nn*r_3d_nn)"
+
+
+class FiducialInnerEgg(ManyLichen):
+    """Inner-most clean yolk volume optimized against radiogenic neutron position distribution
+
+    https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:mcfate:inner_volume_optimization_v2
+
+    Contact: Qing Lin
+    """
+    version = 0
+
+    def __init__(self):
+        self.lichen_list = [self.FiducialInnerEggUpper(),
+                            self.FiducialInnerEggLower(),
+                            self.FiducialInnerEggEdge()]
+
+    class FiducialInnerEggUpper(StringLichen):
+        """Top part of egg
+        """
+        string = "(z_3d_nn < -49.43) | ( ((z_3d_nn+49.43)/36.35)**2.43474462 + (r_3d_nn*r_3d_nn/1367)**2.43474462 < 1.)"
+
+    class FiducialInnerEggLower(StringLichen):
+        """Bottom part of egg
+        """
+        string = "(z_3d_nn > -55.28) | ( (-(z_3d_nn+55.28)/26.24)**2.00197758 + (r_3d_nn*r_3d_nn/1365)**2.00197758 < 1.)"
+
+    class FiducialInnerEggEdge(StringLichen):
+        """Hard radial cut on currently defined bin edge
+        """
+        string = "r_3d_nn < 34.5903754"
+
+
+FV_CONFIGS = [
+    # Mass (kg), (z0, vz, p, vr2)
+    (1000, (-57.58, 31.25, 4.20, 1932.53)),
+    (1025, (-57.29, 31.65, 3.71, 1987.85)),
+    (1050, (-62.25, 33.89, 3.08, 1969.68)),
+    (1075, (-59.73, 35.58, 2.97, 1938.27)),
+    (1100, (-58.36, 36.97, 2.67, 1951.06)),
+    (1125, (-58.57, 37.36, 2.78, 1953.64)),
+    (1150, (-58.71, 37.37, 3.25, 1934.94)),
+    (1175, (-57.35, 38.17, 3.14, 1944.21)),
+    (1200, (-56.44, 39.23, 2.88, 1961.09)),
+    (1225, (-55.81, 40.30, 2.80, 1969.58)),
+    (1250, (-55.44, 40.70, 3.21, 1936.89)),
+    (1275, (-54.62, 41.19, 3.29, 1937.40)),
+    (1300, (-54.04, 42.08, 2.56, 2041.03)),
+    (1325, (-53.31, 42.52, 2.85, 2005.24)),
+    (1350, (-51.63, 43.64, 3.15, 1949.59)),
+    (1375, (-51.85, 44.07, 2.87, 2003.40)),
+    (1400, (-52.22, 43.88, 3.88, 1949.48)),
+    (1425, (-50.87, 45.22, 2.75, 2046.11)),
+    (1450, (-51.66, 43.60, 3.58, 2053.80)),
+    (1475, (-51.99, 43.92, 3.88, 2044.43)),
+    (1500, (-52.50, 43.69, 4.31, 2059.53)),
+    (1525, (-51.51, 44.67, 3.68, 2093.78)),
+    (1550, (-51.13, 45.04, 3.98, 2088.21)),
+    (1575, (-49.44, 46.67, 3.43, 2091.66)),
+    (1600, (-50.15, 45.95, 3.77, 2126.11)),
+    (1625, (-50.06, 45.99, 4.32, 2119.37)),
+    (1650, (-50.16, 45.95, 4.67, 2137.15)),
+    (1675, (-49.10, 47.05, 4.53, 2128.00)),
+    (1700, (-49.54, 46.51, 6.10, 2129.72)),
+]
+
+
+class FiducialTestEllips(StringLichen):
+    """TESTFiducial volume cut using NN 3D FDC.
+    Temporary/under development, for preliminary
+    comparisons between the different masses. For every mass
+    in the fv_config keys a FiducialTestEllips<mass> is made.
+    For more info on the construction of the FV see:
+    https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:analysis:sciencerun1:fiducial_volume:optimized_ellips
+    sanderb@nikhef.nl
+    """
+    version = 1
+    parameter_symbols = tuple('z0 vz p vr2'.split())
+    parameter_values = None   # Will be tuple of parameter values
+    string = "((( (((z_3d_nn-@z0)**2)**0.5) /@vz)**@p)+ (r_3d_nn**2/@vr2)**@p) < 1"
+
+    def _process(self, df):
+        bla = dict(zip(self.parameter_symbols, self.parameter_values))
+        df.loc[:, self.name()] = df.eval(self.string,
+                                         global_dict=bla)
+        return df
 
     def pre(self, df):
-        df.loc[:, 'r_3d_nn'] = np.sqrt(df['x_3d_nn'] * df['x_3d_nn'] + df['y_3d_nn'] * df['y_3d_nn'])
+        df.loc[:, 'r_3d_nn'] = np.sqrt(df['x_3d_nn']**2 + df['y_3d_nn']**2)
         return df
+
+
+for mass, params in FV_CONFIGS:
+    name = 'FiducialTestEllips' + str(int(mass))
+    c = type(name, (FiducialTestEllips,), dict())
+    c.parameter_values = params
+    locals()[name] = c
 
 
 class FiducialFourLeafClover1250kg(StringLichen):
@@ -337,7 +473,7 @@ class AmBeFiducial(StringLichen):
     string = "(distance_to_source < 103.5) & (-92.9 < z) & (z < -9) & (sqrt(x*x + y*y) < 42.00)"
 
     def pre(self, df):
-        source_position = (55.965311731903, 43.724893639103577, -50)
+        source_position = (97, 43.5, -50)
         df.loc[:, 'distance_to_source'] = ((source_position[0] - df['x']) ** 2 +
                                            (source_position[1] - df['y']) ** 2 +
                                            (source_position[2] - df['z']) ** 2) ** 0.5
@@ -389,62 +525,84 @@ class S1MaxPMT(StringLichen):
     string = "s1_largest_hit_area < 0.052 * s1 + 4.15"
 
 
-class S1PatternLikelihood(Lichen):
+class S1PatternLikelihood(ManyLichen):
     """Reject accidendal coicident events from lone s1 and lone s2.
 
-    Details of the likelihood can be seen in the following note. Here, 97
-    quantile acceptance line estimated with Rn220 data (pax_v6.4.2) is used.
+    Details of the likelihood and cut definitions can be seen in the following notes.
+       SR0: xenon:xenon1t:analysis:summary_note:s1_pattern_likelihood_cut
+       SR1: xenon:xenon1t:kazama:s1_pattern_cut_sr1,
+            xenon:xenon1t:kazama:s1_pattern_cut_sr1#update_2018_jan_24th
 
-       xenon:xenon1t:analysis:summary_note:s1_pattern_likelihood_cut
+    Requires PositionReconstruction minitrees (hax#174).
+    Contact: Shingo Kazama <kazama@physik.uzh.ch>
+    """
+    version = 3
+
+    def __init__(self):
+        self.lichen_list = [self.S1TopPatternLikelihood(),
+                            self.S1BottomPatternLikelihood()]
+
+    class S1TopPatternLikelihood(Lichen):
+        """S1PatternLikelihood cut based on the top PMT array
+        """
+
+        def _process(self, df):
+            s1t = df['s1'] * df['s1_area_fraction_top']
+            df.loc[:, self.name()] = (df['s1_pattern_fit_hax'] - df['s1_pattern_fit_bottom_hax'] <
+                                      13.0 + 2.3 * s1t**0.5 + 8.0 * s1t - 1.0 * s1t**1.5 + 0.04 * s1t**2.0)
+            return df
+
+    class S1BottomPatternLikelihood(Lichen):
+        """S1PatternLikelihood cut based on the bottom PMT array
+        """
+
+        def _process(self, df):
+            s1b = df['s1'] * (1. - df['s1_area_fraction_top'])
+            df.loc[:, self.name()] = (df['s1_pattern_fit_bottom_hax'] < - 10.5 + 21.9 * s1b**0.5 +
+                                      1.44 * s1b - 0.21 * s1b**1.5 + 0.0064 * s1b**2.0)
+            return df
+
+
+class S1Width(StringLichen):
+    """Reject accidendal coicidence events from lone s1 and lone s2.
+    This cut is optimized to remove anomalous leakage (probably AC) candidates found in Rn220 SR1 data.
+    Details of the cut definition and acceptance can be seen in the following note.
+    xenon:xenon1t:analysis:sciencerun1:anomalous_background#s1_width_cut_for_removing_remaining_ac_events
 
     Requires Extended minitrees.
+    Contact: Shingo Kazama <kazama@physik.uzh.ch>
+    """
 
+    version = 1
+    string = "s1_range_90p_area < 251.528247 + 11.50 * s1**1.171407 * exp(-0.057395 * s1)"
+
+
+class S1AreaUpperInjectionFraction(StringLichen):
+    """Reject accidendal coicidence events happened near the upper Rn220 injection point (near PMT 131)
+
+    Details of the cut definition and acceptance can be seen in the following notes.
+    xenon:xenon1t:analysis:sciencerun1:anomalous_background#signal_area_fraction_near_rn220_injection_points
+
+    Requires PositionReconstruction minitrees.
+    Contact: Shingo Kazama <kazama@physik.uzh.ch>
+    """
+
+    version = 1
+    string = "s1_area_upper_injection_fraction < 0.0865 + 1.205 / (s1**0.83367)"
+
+
+class S1AreaLowerInjectionFraction(StringLichen):
+    """Reject accidendal coicidence events happened near the lower Rn220 injection point (near PMT 243)
+
+    Details of the cut definition and acceptance can be seen in the following notes.
+    xenon:xenon1t:analysis:sciencerun1:anomalous_background#signal_area_fraction_near_rn220_injection_points
+
+    Requires PositionReconstruction minitrees.
     Contact: Shingo Kazama <kazama@physik.uzh.ch>
     """
 
     version = 0
-
-    def pre(self, df):
-        df.loc[:, 'temp'] = -2.39535 + \
-            25.5857 * pow(df['s1'], 0.5) + \
-            1.30652 * df['s1'] - \
-            0.0638579 * np.power(df['s1'], 1.5)
-        return df
-
-    def _process(self, df):
-        df.loc[:, self.name()] = df['s1_pattern_fit'] < df.temp
-        return df
-
-
-class S1SingleScatter(Lichen):
-    """Requires only one valid interaction between the largest S2, and any S1 recorded before it.
-
-    The S1 cut checks that any possible secondary S1s recorded in a waveform, could not have also
-    produced a valid interaction with the primary S2. To check whether an interaction between the
-    second largest S1 and the largest S2 is valid, we use the S2Width cut. If the event would pass
-    the S2Width cut, a valid second interaction exists, and we may have mis-identified which S1 to
-    pair with the primary S2. Therefore we cut this event. If it fails the S2Width cut the event is
-    not removed.
-
-    Current version is developed on unblinded Bkg data (paxv6.4.2). It is described in this note:
-    https://xecluster.lngs.infn.it/dokuwiki/doku.php?id=xenon:xenon1t:jacques:s1_single_scatter_cut
-
-    It should be applicable to data regardless of if it is ER or NR.
-
-    Contact: Jacques <jpienaa@purdue.edu>
-    """
-
-    version = 1
-
-    def _process(self, df):
-        s2width = S2Width
-
-        alt_rel_width = df['s2_range_50p_area'] / s2width.s2_width_model(df['alt_s1_interaction_z'])
-        alt_interaction_passes = alt_rel_width < s2width.relative_s2_width_bounds(df.s2.values, kind='high')
-        alt_interaction_passes &= alt_rel_width > s2width.relative_s2_width_bounds(df.s2.values, kind='low')
-
-        df.loc[:, (self.name())] = True ^ alt_interaction_passes
-        return df
+    string = "s1_area_lower_injection_fraction < 0.0550 + 1.56 / (s1**0.87000)"
 
 
 class S2AreaFractionTop(Lichen):
@@ -502,6 +660,48 @@ class S2AreaFractionTop(Lichen):
             return self._process_v3(df)
         else:
             raise ValueError('Only versions 2 and 3 are implemented')
+
+
+class CS2AreaFractionTop(ManyLichen):
+    """cS2 area fraction top cut
+
+    Designed to target gas events.
+    The acceptance is 99% by design.
+    Valid in S2 range 0-10000
+
+    See the note at xenon:xenon1t:adam:s2aft:sr1_cs2_cut
+    """
+    version = 0
+
+    class CS2AreaFractionTopUpper(StringLichen):
+        """cS2 AFT upper bound
+        """
+        string = 'cs2_aft < 0.63756073 + 1.42873942 / sqrt(s2)'
+
+    class CS2AreaFractionTopLower(StringLichen):
+        """cS2 AFT lower bound
+        """
+        string = 'cs2_aft > 0.62752992 - 1.79928264 / sqrt(s2)'
+
+    lichen_list = [
+        CS2AreaFractionTopUpper(),
+        CS2AreaFractionTopLower()
+    ]
+
+    def pre(self, df):
+        df.loc[:, 'cs2_aft'] = df['cs2_top'] / df['cs2']
+        return df
+
+
+class CS2AreaFractionTop96p(StringLichen):
+    """cS2 area fraction top cut with 96% acceptance
+
+    Designed to strongly target gas events, removing all
+    those found in calibration samples at the top of the TPC.
+
+    See the note at xenon:xenon1t:adam:s2aft:sr1_cs2_cut
+    """
+    string = 'cs2_aft < 0.63594139 + 0.912103 / sqrt(s2) | z < -9'
 
 
 class S2SingleScatter(Lichen):
@@ -563,7 +763,7 @@ class S2PatternLikelihood(StringLichen):
     Contact: Bart Pelssers  <bart.pelssers@fysik.su.se> Tianyu Zhu  <tz2263@columbia.edu>
     """
     version = 1
-    string = "s2_pattern_fit < 0.0390*s2 + 609*s2**0.0602 - 666"
+    string = "s2_pattern_fit < 0.0390 * s2 + 609 * s2**0.0602 - 666"
 
 
 class S2Threshold(StringLichen):
@@ -577,118 +777,115 @@ class S2Threshold(StringLichen):
     string = "200 < s2"
 
 
-class S2Width(ManyLichen):
+class S2Width(Lichen):
     """S2 Width cut based on diffusion model
-
     The S2 width cut compares the S2 width to what we could expect based on its depth in the detector. The inputs to
     this are the drift velocity and the diffusion constant. The allowed variation in S2 width is greater at low
     energy (since it is fluctuating statistically) Ref: (arXiv:1102.2865)
-
     It should be applicable to data regardless of if it ER or NR;
     above cS2 = 1e5 pe ERs the acceptance will go down due to track length effects.
-
-    Tune the diffusion model parameters based on pax v6.4.2 AmBe data according to note:
-
-    xenon:xenon1t:yuehuan:analysis:0sciencerun_s2width_update0#comparison_with_diffusion_model_cut_by_jelle_pax_v642
-
-    Contact: Yuehuan <weiyh@physik.uzh.ch>, Jelle <jaalbers@nikhef.nl>
+    around S2 = 1e5 pe there are beta-gamma merged peaks from Pb214 that extends the S2 width
+    Tune the diffusion model parameters based on fax data according to note:
+    https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:sim:notes:tzhu:width_cut_tuning#toy_fax_simulation
+    Contact: Tianyu <tz2263@columbia.edu>, Yuehuan <weiyh@physik.uzh.ch>, Jelle <jaalbers@nikhef.nl>
     """
-    version = 2
+    version = 6
 
-    def __init__(self):
-        self.lichen_list = [self.S2WidthHigh(),
-                            self.S2WidthLow()]
+    diffusion_constant = 25.26 * ((units.cm)**2) / units.s
+    v_drift = 1.440 * (units.um) / units.ns
+    scg = 23.0  # s2_secondary_sc_gain in pax config
+    scw = 258.41  # s2_secondary_sc_width median
+    SigmaToR50 = 1.349
+    DriftTimeFromGate = 1.6 * units.us
 
-    @staticmethod
-    def s2_width_model(z):
-        diffusion_constant = 22.8 * ((units.cm)**2) / units.s
-        v_drift = 1.44 * (units.um) / units.ns
-        GausSigmaToR50 = 1.349
+    def s2_width_model(self, drift_time):
+        """Diffusion model
+        """
+        return np.sqrt(2 * self.diffusion_constant * (drift_time - self.DriftTimeFromGate) / self.v_drift ** 2)
 
-        EffectivePar = 1.10795
-        Sigma_0 = 258.41 * units.ns
-        return GausSigmaToR50 * np.sqrt(Sigma_0 ** 2 - EffectivePar * 2 * diffusion_constant * z / v_drift ** 3)
-
-    def subpre(self, df):
-        # relative_s2_width
-        df.loc[:, 'temp'] = df['s2_range_50p_area'] / S2Width.s2_width_model(df['z'])
+    def _process(self, df):
+        df.loc[:, self.name()] = True  # Default is True
+        mask = df.drift_time > self.DriftTimeFromGate
+        df.loc[mask, 'nElectron'] = np.clip(df.loc[mask, 's2'], 0, 5000) / self.scg
+        df.loc[mask, 'normWidth'] = (np.square(df.loc[mask, 's2_range_50p_area'] / self.SigmaToR50) -
+                                     np.square(self.scw)) / np.square(self.s2_width_model(df.loc[mask, 'drift_time']))
+        df.loc[mask, self.name()] = chi2.logpdf(df.loc[mask, 'normWidth'] * (df.loc[mask, 'nElectron'] - 1),
+                                                df.loc[mask, 'nElectron']) > - 14
         return df
 
-    @staticmethod
-    def relative_s2_width_bounds(s2, kind='high'):
-        x = 0.5 * np.log10(np.clip(s2, 150, 4500 if kind == 'high' else 2500))
-        if kind == 'high':
-            return 3 - x
-        elif kind == 'low':
-            return -0.9 + x
-        raise ValueError("kind must be high or low")
-
-    class S2WidthHigh(Lichen):
-
-        def pre(self, df):
-            return S2Width.subpre(self, df)
-
-        def _process(self, df):
-            df.loc[:, self.name()] = (df.temp <= S2Width.relative_s2_width_bounds(df.s2,
-                                                                                  kind='high'))
-            return df
-
-    class S2WidthLow(RangeLichen):
-
-        def pre(self, df):
-            return S2Width.subpre(self, df)
-
-        def _process(self, df):
-            df.loc[:, self.name()] = (S2Width.relative_s2_width_bounds(df.s2,
-                                                                       kind='low') <= df.temp)
-            return df
+    def post(self, df):
+        for temp_column in ['nElectron', 'normWidth']:
+            if temp_column in df.columns:
+                df.drop(temp_column, 1, inplace=True)
+        return df
 
 
-class S1AreaFractionTop(RangeLichen):
+class S1SingleScatter(Lichen):
+    """Requires only one valid interaction between the largest S2, and any S1 recorded before it.
+
+    The S1 cut checks that any possible secondary S1s recorded in a waveform, could not have also
+    produced a valid interaction with the primary S2. To check whether an interaction between the
+    second largest S1 and the largest S2 is valid, we use the S2Width cut. If the event would pass
+    the S2Width cut, a valid second interaction exists, and we may have mis-identified which S1 to
+    pair with the primary S2. Therefore we cut this event. If it fails the S2Width cut the event is
+    not removed.
+
+    Current version is developed on calibration data (pax v6.8.0). It is described in this note:
+    https://xecluster.lngs.infn.it/dokuwiki/doku.php?id=xenon:xenon1t:jacques:s1_single_scatter_cut_sr1
+
+    It should be applicable to data regardless whether it is ER or NR.
+
+    Contact: Jacques Pienaar, <jpienaar@uchicago.edu>
+    """
+
+    version = 4
+    s2width = S2Width
+
+    def _process(self, df):
+        df.loc[:, self.name()] = True  # Default is True
+        mask = df.alt_s1_interaction_drift_time > self.s2width.DriftTimeFromGate
+        alt_n_electron = np.clip(df.loc[mask, 's2'], 0, 5000) / self.s2width.scg
+
+        # Alternate S1 relative width
+        alt_rel_width = np.square(df.loc[mask,
+                                         's2_range_50p_area'] / self.s2width.SigmaToR50) - np.square(self.s2width.scw)
+        alt_rel_width /= np.square(self.s2width.s2_width_model(self.s2width,
+                                                               df.loc[mask, 'alt_s1_interaction_drift_time']))
+
+        alt_interaction_passes = chi2.logpdf(alt_rel_width * (alt_n_electron - 1), alt_n_electron) > - 20
+
+        df.loc[mask, (self.name())] = True ^ alt_interaction_passes
+
+        return df
+
+
+class S1AreaFractionTop(StringLichen):
     '''S1 area fraction top cut
 
     Uses a modified version of scipy.stats.binom_test to compute a p-value based on the
-    observed number of s1 photons in the top array, given the expected
-    probability that a photon at the event's (x,y,z) makes it to the top array.
+    observed number of s1 photons in the top array, given the expected probability (derived
+    from Kr83m 32 keV line) that a photon at the event's (x,y,z) makes it to the top array.
     Modifications made to original algorithm implemented in pax increase sensitivity for small s1s.
-    For pax < v6.6.0 computes p-value live, otherwise loads it from disk. Computation done here is
-    not as accurate as in pax > v6.6.5
+    Algorithm imported in PositionReconstruction treemaker using corrected positions to calculate
+    p-value.
 
-    Ideally requires Extended minitrees >= v0.0.4
-
-    Uses a 3D map generated with Kr83m 32 keV line
+    Requires PositionReconstruction minitrees.
 
     note: https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:darryl:xe1t_s1_aft_map
     also https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:darryl:s1_aft_update
 
     Contact: Darryl Masson, dmasson@purdue.edu
+             Shingo Kazama, kazama@physik.uzh.ch
     '''
-
-    variable = 's1_area_fraction_top_probability'
-    allowed_range = (1e-4, 1 + 1e-7)  # must accept p-value = 1.0 with a < comparison
-    version = 2
-
-    def __init__(self):
-        aftmap_filename = os.path.join(DATA_DIR, 's1_aft_rz_02Mar2017.json')
-        with open(aftmap_filename) as data_file:
-            data = json.load(data_file)
-        r_pts = np.array(data['r_pts'])
-        z_pts = np.array(data['z_pts'])
-        aft_vals = np.array(data['map']).reshape(len(r_pts), len(z_pts))
-        self.aft_map = RectBivariateSpline(r_pts, z_pts, aft_vals)
-
-    def pre(self, df):
-        if self.variable not in df:
-            df.loc[:, self.variable] = df.apply(lambda row: binom_test(np.round(row['s1_area_fraction_top'] * row['s1']),
-                                                                       np.round(row['s1']),
-                                                                       self.aft_map(np.sqrt(row['x']**2 + row['y']**2),
-                                                                                    row['z'])[0, 0]),
-                                                axis=1)
-        return df
+    version = 4
+    string = "s1_area_fraction_top_probability_hax > 0.001"
 
 
 class PreS2Junk(StringLichen):
     """Cut events with lot of peak area before main S2
+
+    SR0: https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:yuehuan:analysis:0sciencerun_signal_noise
+    SR1: https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:julien:analysis:sciencerun1:s1_noise_cut
 
     Contact: Julien Wulf <jwulf@physik.uzh.ch>
     """
@@ -696,43 +893,116 @@ class PreS2Junk(StringLichen):
     string = "area_before_main_s2 - s1 < 300"
 
 
-class SingleElectronS2s(Lichen):
-    """Remove mis-identified single electron S2s classified as S1s
+class MuonVeto(ManyLichen):
+    """Remove events in coincidence with Muon Veto triggers and when MV off.
 
-    Details of the definition can be seen in the following note:
+    Requires Proximity minitrees.
 
-    https://xecluster.lngs.infn.it/dokuwiki/doku.php?id=xenon:xenon1t:analysis:firstresults:exploring_se_cut
+    https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:analysis:mv_cut_sr1
 
-    This was done by redrawing and improving the classification bounds for S1s at low energies by
-    building up from Jelles low-energy classification work at a peaks level.
-    To do this Rn220 data processed in pax.v6.4.2 was used.
-
-    Requires: TotalProperties, LowEnergyS1Candidates minitrees.
-
-    Contact: Miguel Angel Vargas <m_varg03@uni-muenster.de>
+    Contact: Andrea Molinario <andrea.molinario@lngs.infn.it>
     """
     version = 3
-    allowed_range_area = (10, 200)
-    allowed_range_rt = (11, 450)
-    area_variable = 's1'
-    rt_variable = 's1_rise_time'
-    aft_variable = 's1_area_fraction_top'
 
-    bound = interpolate.interp1d([0, 0.3, 0.4, 0.5, 0.60, 0.60, 1.0], [70, 70, 61, 61, 35, 0, 0], kind='linear')
+    def __init__(self):
+        self.lichen_list = [self.MuonVetoOn(),
+                            self.MuonVetoCoincidence()]
+
+    class MuonVetoCoincidence(StringLichen):
+        """Checks the distance in time (ns) between a reference position inside the waveform
+        and the nearest MV trigger.
+        The event is excluded if the nearest MV trigger falls in a [-2ms,+3ms] time window
+        with respect to the reference position.
+        """
+
+        string = "nearest_muon_veto_trigger < -2e6 | nearest_muon_veto_trigger > 3e6"
+
+    class MuonVetoOn(StringLichen):
+        """Remove events when MV was not working (abs(nearest_muon_veto_trigger)>20 s).
+        """
+
+        string = "nearest_muon_veto_trigger > -2e10 & nearest_muon_veto_trigger < 2e10"
+
+
+class KryptonMisIdS1(StringLichen):
+    """Remove events where the 32 keV S1 of Kr83m decay is identified as an S2.
+    These events appear above the ER band since the S1 is from the 9 keV decay
+    but the S2 is combined for a 41 keV event.
+    See the note:
+    https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:adam:inelastic:cuts:kr_contamination:mis_ided_s1
+    Contact: Adam Brown <abrown@physik.uzh.ch>
+    """
+    version = 0
+    string = "largest_other_s2 < 100 | largest_other_s2_delay_main_s1 < -3000 | largest_other_s2_delay_main_s1 > 0"
+
+
+class Flash(Lichen):
+    """Cuts events within a flash. This is defined as the width were the BUSY on channel is "high".
+    In addition an extended time-window around the flash is removed as well.
+    The length of the extended time-window is not finalized yet
+    Needs FlashIdentification minitree
+    Information: https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:analysis:sciencerun1:flashercut
+    Contact: Oliver Wack <oliver.wack@mpi-hd.mpg.de>
+    """
+
+    version = 0
 
     def _process(self, df):
-        # Is the event inside the area box considered for this study?
-        cond1 = ((df[self.area_variable] > self.allowed_range_area[0]) &
-                 (df[self.area_variable] < self.allowed_range_area[1]) &
-                 (df[self.rt_variable] > self.allowed_range_rt[0]) &
-                 (df[self.rt_variable] < self.allowed_range_rt[1]))
-        cond2 = (df[self.rt_variable] < SingleElectronS2s.bound(df[self.aft_variable]))
+        df.loc[:, self.name()] = ((df['inside_flash'] == False) &
+                                  ((df.nearest_flash != df.nearest_flash) |
+                                   (df['nearest_flash'] > 120e9) |
+                                   (df['nearest_flash'] < (-10e9 - df['flashing_width'] * 1e9))
+                                   )
+                                  )
+        return df
 
-        # Pass events by default
-        passes = np.ones(len(df), dtype=np.bool)
 
-        # Reject events inside the box that don't pass the bound
-        passes = (True ^ (cond1)) | (cond1 & cond2)
+class PosDiff(Lichen):
+    """
+    Note: https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenon1t:analysis:sr1:pos_cut_v4
+    This cut is defined for removing the events with large position difference between NN and TPF alogrithm,
+    which can partly remove wall leakage events due to the small size of S2.
+    Contact: Yuehuan Wei <ywei@physics.ucsd.edu>, Tianyu Zhu <tz2263@columbia.edu>
+    """
+    version = 4
 
-        df.loc[:, self.name()] = passes
+    def _process(self, df):
+        df.loc[:, self.name()] = (np.sqrt((df['x_observed_nn'] - df['x_observed_tpf'])**2 +
+                                          (df['y_observed_nn'] - df['y_observed_tpf'])**2) <
+                                  2429.322 * np.exp(-np.log10(df.s2) / 0.362) + 1.587)
+        return df
+
+
+class SingleElectronS2s(Lichen):  # noqa
+    """To classify S1s from single electron S2s. Features (area, area_fraction_top, rise_time, range_90p_area) from
+    S1 and single electron S2s samples are used to train a Gradient-BDT and Random-Forest classifier. A weight average
+    voting was then used to distinguish the two samples and cut is defined in this new parameter space.
+    Information: xenon:xenon1t:analysis:subgroup:cuts:meetings:20180126:se_classification
+    Contact: Fei Gao <feigao.ge@gmail.com>
+    """
+
+    version = 5
+
+    def _process(self, df):
+
+        # Random forest classifier
+        forest_filename = os.path.join(DATA_DIR, 'XENON1T_random_forest_peak_classifier_02052018.pkl')
+        forest_load = pickle.load(open(forest_filename, 'rb'))  # noqa
+
+        # Gradient Boosted Decesion Tree classifier
+        gbdt_filename = os.path.join(DATA_DIR, 'XENON1T_gradient_bdt_peak_classifier_02052018.pkl')
+        gbdt_load = pickle.load(open(gbdt_filename, 'rb'))  # noqa
+
+        def _classifier_soft(features):
+            return 0.5 * forest_load.predict_proba(features) + 0.5 * gbdt_load.predict_proba(features)
+
+        df.loc[:, 'ses2prob'] = _classifier_soft(df[['s1', 's1_area_fraction_top', 's1_rise_time',
+                                                     's1_range_90p_area']])[:, 1]
+
+        cut_threshold = 0.9
+
+        # current model is trained by data with S1 < 70PE and S1 width < 450PE
+        df.loc[:, self.name()] = (((df['ses2prob'] <= cut_threshold) & (df['s1_range_90p_area'] < 450)) |
+                                  (df['s1'] > 70))
+
         return df
